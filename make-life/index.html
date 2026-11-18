@@ -13,6 +13,8 @@
   #speed button { opacity: 0.7; width: 40px; height: 28px; padding: 0; font-size: 14px; line-height: 1;
                   display: flex; align-items: center; justify-content: center; } /* same size, text centered */
   #speed button.on { opacity: 1; background: #8f8; font-weight: bold; } /* the speed you're using now */
+  #nav { position: absolute; top: 46px; right: 10px; text-align: right; font-size: 14px; line-height: 1.5; user-select: none;
+         text-shadow: 0 1px 3px #000; display: none; }
   button { font-size: 16px; margin: 4px 4px 0 0; padding: 8px 12px; cursor: pointer; }
 </style>
 </head>
@@ -23,7 +25,8 @@
   <div id="buttons"></div>
 </div>
 <div id="speed"></div>
-<div id="help">Drag mouse: look &middot; W/A/S/D: move &middot; E/Q: up/down &middot; Shift: fast &middot; On land: walk or fly over the sea to other islands, Q to dive in &middot; F: fly to planet &middot; 1-7: speed 1x/2x/5x/10x/20x/40x/60x</div>
+<div id="nav"></div>
+<div id="help">Drag mouse: look &middot; W/A/S/D: move &middot; E/Q: up/down &middot; Shift: fast &middot; On land: walk or fly over the sea to other islands, Q to dive in &middot; F: fly to planet &middot; In space: hold Shift to warp to other stars and galaxies, H: fly home &middot; 1-7: speed 1x/2x/5x/10x/20x/40x/60x</div>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
 <script>
@@ -128,20 +131,20 @@ function craterShade(x, y, z, list) { // 1 = flat ground, darker crater floors, 
 }
 
 // A thin glowing air layer: bright at the edge of the ball, only on the side facing the star
-function atmosphere(r, color, power) {
+function atmosphere(r, color, power, sun = new THREE.Vector3()) { // sun: where its star is
   return new THREE.Mesh(new THREE.SphereGeometry(r, 48, 48), new THREE.ShaderMaterial({
-    uniforms: { color: { value: new THREE.Color(color) }, power: { value: power } },
+    uniforms: { color: { value: new THREE.Color(color) }, power: { value: power }, sun: { value: sun } },
     vertexShader: `varying vec3 vN; varying vec3 vW;
       void main() {
         vN = normalize(mat3(modelMatrix) * normal);
         vec4 w = modelMatrix * vec4(position, 1.0); vW = w.xyz;
         gl_Position = projectionMatrix * viewMatrix * w;
       }`,
-    fragmentShader: `uniform vec3 color; uniform float power; varying vec3 vN; varying vec3 vW;
+    fragmentShader: `uniform vec3 color; uniform float power; uniform vec3 sun; varying vec3 vN; varying vec3 vW;
       void main() {
         vec3 n = normalize(vN), v = normalize(cameraPosition - vW);
         float rim = pow(1.0 - max(dot(n, v), 0.0), 2.5);
-        float lit = smoothstep(-0.25, 0.5, dot(n, normalize(-vW))); // the star is at the center (0,0,0)
+        float lit = smoothstep(-0.25, 0.5, dot(n, normalize(sun - vW)));
         gl_FragColor = vec4(color * rim * lit * power, 1.0);
       }`,
     blending: THREE.AdditiveBlending, transparent: true, depthWrite: false
@@ -187,21 +190,21 @@ for (let i = 0; i < 4000; i++) {
 }
 const starGeo = new THREE.BufferGeometry();
 starGeo.setAttribute("position", new THREE.Float32BufferAttribute(pts, 3));
-space.add(new THREE.Points(starGeo, new THREE.PointsMaterial({ color: 0xffffff, size: 1.5, sizeAttenuation: false })));
+// (In space, these stars are now part of the galaxy view: see galaxyScene.)
 
-// Step 1: make a star
-function makeStar() {
-  // The star's surface is drawn by a shader (a tiny program on the graphics card), so it can boil:
-  // bright granules of hot gas, dark cooler sunspots, and edges that look dimmer and redder.
-  star = new THREE.Mesh(new THREE.SphereGeometry(8, 64, 64), new THREE.ShaderMaterial({
-    uniforms: { time: { value: 0 } },
+// A star's surface, drawn by a shader (a tiny program on the graphics card), so it can boil:
+// bright granules of hot gas, dark cooler sunspots, and edges that look dimmer and redder.
+// tint changes its color: red dwarfs, blue giants...
+function starMaterial(tint) {
+  return new THREE.ShaderMaterial({
+    uniforms: { time: { value: 0 }, tint: { value: new THREE.Vector3(...tint) } },
     vertexShader: `varying vec3 vPos; varying vec3 vN; varying vec3 vV;
       void main() {
         vPos = position; vN = normalize(normalMatrix * normal);
         vec4 mv = modelViewMatrix * vec4(position, 1.0); vV = -mv.xyz;
         gl_Position = projectionMatrix * mv;
       }`,
-    fragmentShader: `uniform float time; varying vec3 vPos; varying vec3 vN; varying vec3 vV;
+    fragmentShader: `uniform float time; uniform vec3 tint; varying vec3 vPos; varying vec3 vN; varying vec3 vV;
       float hash(vec3 p) { p = fract(p * 0.3183099 + 0.1); p *= 17.0; return fract(p.x * p.y * p.z * (p.x + p.y + p.z)); }
       float noise(vec3 x) {
         vec3 i = floor(x), f = fract(x); f = f * f * (3.0 - 2.0 * f);
@@ -219,9 +222,14 @@ function makeStar() {
         col = mix(col, vec3(1.0, 0.96, 0.82), smoothstep(0.6, 1.0, heat));
         float mu = clamp(dot(normalize(vN), normalize(vV)), 0.0, 1.0);
         col *= (0.45 + 0.55 * pow(mu, 0.45)) * mix(vec3(1.0, 0.6, 0.35), vec3(1.0), pow(mu, 0.3)); // limb darkening
-        gl_FragColor = vec4(col * 1.2, 1.0);
+        gl_FragColor = vec4(col * tint * 1.2, 1.0);
       }`
-  }));
+  });
+}
+
+// Step 1: make a star
+function makeStar() {
+  star = new THREE.Mesh(new THREE.SphereGeometry(8, 64, 64), starMaterial([1, 1, 1]));
   space.add(star);
 
   // Corona: a bright inner glow and a big faint halo around the star
@@ -371,6 +379,243 @@ function makeWorlds() {
     orbit.rotation.x = -Math.PI / 2;
     space.add(orbit, holder);
     worlds.push({ holder, ball, moons, dist: type.dist, r: type.r, angle: Math.random() * Math.PI * 2 });
+  }
+}
+
+// ---------- The galaxy: other star systems and other galaxies ----------
+// Space is HUGE, so faraway things live in a second, shrunk-down scene that is drawn behind
+// everything else: 1 unit in galaxyScene = GSCALE units in space. Its camera moves along with yours.
+const GSCALE = 100;
+const galaxyScene = new THREE.Scene(), galaxyCam = new THREE.PerspectiveCamera(70, innerWidth / innerHeight, 0.5, 400000);
+const GAL_CENTER = new THREE.Vector3(-250, 0, 60), GAL_R = 600; // your star is out in one of the spiral arms
+const navEl = document.getElementById("nav");
+
+// A cloud of stars shaped like a galaxy: spiral arms around a glowing middle (or one big round blob)
+function starCloud({ n, r, arms = 2, inner, outer, thick = 8, center, tilt = [0, 0], elliptical = false, ours = false }) {
+  const pos = [], col = [], cIn = new THREE.Color(inner), cOut = new THREE.Color(outer), c = new THREE.Color();
+  for (let i = 0; i < n; i++) {
+    let x, y, z, f;
+    if (elliptical || Math.random() < 0.2) {             // the round bulge in the middle
+      const d = r * (elliptical ? 1 : 0.18) * Math.pow(Math.random(), 1.8), t = Math.random() * Math.PI * 2, ph = Math.acos(2 * Math.random() - 1);
+      x = d * Math.sin(ph) * Math.cos(t); y = d * Math.cos(ph) * 0.55; z = d * Math.sin(ph) * Math.sin(t); f = d / r * (elliptical ? 1 : 0.3);
+    } else {                                              // spiral arms that wind around the middle
+      const d = r * (0.1 + 0.9 * Math.pow(Math.random(), 0.8)), spread = (Math.random() - 0.5) * 0.7 * (1.1 - d / r);
+      const a = (i % arms) / arms * Math.PI * 2 + d / r * 4 + spread;
+      x = Math.cos(a) * d; z = Math.sin(a) * d; y = rand(thick) * (1 - d / r * 0.6); f = d / r;
+    }
+    if (ours && Math.hypot(x + center.x, y + center.y, z + center.z) < 4) continue; // keep the space around your own star clear
+    pos.push(x, y, z);
+    c.copy(cIn).lerp(cOut, f).multiplyScalar(0.5 + Math.random() * 0.7);
+    col.push(c.r, c.g, c.b);
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute("position", new THREE.Float32BufferAttribute(pos, 3));
+  geo.setAttribute("color", new THREE.Float32BufferAttribute(col, 3));
+  const g = new THREE.Group();
+  g.add(new THREE.Points(geo, new THREE.PointsMaterial({ size: 2, sizeAttenuation: false, vertexColors: true, transparent: true, depthWrite: false, blending: THREE.AdditiveBlending })));
+  const core = new THREE.Sprite(new THREE.SpriteMaterial({ map: glowTex, color: inner, transparent: true, opacity: ours ? 0.45 : 0.8, depthWrite: false, blending: THREE.AdditiveBlending }));
+  core.scale.setScalar(r * (elliptical ? 1.2 : 0.5));
+  g.add(core);
+  g.position.copy(center);
+  if (!ours) g.rotation.set(tilt[0], Math.random() * 7, tilt[1]);
+  galaxyScene.add(g);
+  return g;
+}
+// A name tag that stays the same size on screen however far away it is
+function farLabel(text, pos, size = 0.035) {
+  const l = makeLabel(text);
+  Object.assign(l.material, { sizeAttenuation: false, depthTest: false });
+  l.scale.set(size * 5.33, size, 1);
+  l.center.set(0.5, -0.6); // sits just above its spot
+  l.position.copy(pos);
+  l.renderOrder = 5;
+  galaxyScene.add(l);
+  return l;
+}
+function farDot(pos, color, size = 0.035) { // a glowing dot that stays visible from far away
+  const s = new THREE.Sprite(new THREE.SpriteMaterial({ map: glowTex, color, sizeAttenuation: false, transparent: true, depthWrite: false, blending: THREE.AdditiveBlending }));
+  s.scale.setScalar(size);
+  s.position.copy(pos);
+  galaxyScene.add(s);
+  return s;
+}
+
+// Your galaxy, plus the nearby stars all around you
+starCloud({ n: 60000, r: GAL_R, arms: 4, inner: 0xfff0d0, outer: 0x9fc0ff, thick: 8, center: GAL_CENTER, ours: true });
+const ourLabel = farLabel("🌌 Your galaxy", GAL_CENTER.clone().setY(40), 0.05);
+{
+  const pos = [];
+  for (let i = 0; i < 2500; i++) {
+    const v = new THREE.Vector3(rand(1), rand(1), rand(1)).normalize().multiplyScalar(4 + Math.random() * 40);
+    pos.push(v.x, v.y, v.z);
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute("position", new THREE.Float32BufferAttribute(pos, 3));
+  galaxyScene.add(new THREE.Points(geo, new THREE.PointsMaterial({ color: 0xffffff, size: 1.5, sizeAttenuation: false })));
+}
+const homeDot = farDot(new THREE.Vector3(), 0xffd27a), homeLabel = farLabel("☀️ Home", new THREE.Vector3());
+
+// Other galaxies, very, very far away
+const galaxies = [
+  { name: "🌌 Andromeda", at: [9000, 1500, -6000], r: 700, arms: 2, inner: 0xfff0d0, outer: 0x8fb0ff, tilt: [0.4, 0.2] },
+  { name: "🌌 Triangulum", at: [-7000, -2000, 8000], r: 350, arms: 3, inner: 0xfff4e0, outer: 0x7fd0ff, tilt: [1.0, 0.3] },
+  { name: "🌌 Whirlpool", at: [3000, 6000, 11000], r: 400, arms: 2, inner: 0xffe0b0, outer: 0xff9fd0, tilt: [0.2, 0.9] },
+  { name: "🌌 Sombrero", at: [-12000, 3000, -4000], r: 450, arms: 1, inner: 0xffe8c0, outer: 0xffd090, tilt: [1.45, 0], thick: 15 },
+  { name: "🌌 M87, a giant elliptical", at: [15000, -4000, 5000], r: 900, inner: 0xffe0b0, outer: 0xff9f60, elliptical: true }
+].map(G => {
+  G.group = starCloud({ ...G, n: G.elliptical ? 15000 : 12000, center: new THREE.Vector3(...G.at) });
+  farLabel(G.name, G.group.position.clone().setY(G.group.position.y + G.r * 0.4), 0.045);
+  return G;
+});
+
+// ----- Other star systems you can visit -----
+const SYSTEMS = [
+  { name: "Vela Prime", at: [3200, 60, -1900], tint: [1, 0.85, 0.65], color: 0xffd9a0, size: 7,
+    planets: [["cratered", 1.3, 26], ["ocean", 3.2, 52], ["gas", 7, 120, ["#c9a27a", "#e8d3b0", "#a7724f", "#f0e2c8"]]],
+    life: "🌊 An OCEAN WORLD, covered in deep water. Scientists think tiny living cells could swim in seas like these!" },
+  { name: "Kestrel's Eye", at: [-4200, -120, -3600], tint: [1, 0.5, 0.35], color: 0xff7a50, size: 4,
+    planets: [["eyeball", 2.4, 18], ["cratered", 1, 34]],
+    life: "👁️ This planet always shows the same face to its red star: one side is scorching, the other is frozen. Life might live in the twilight ring in between!" },
+  { name: "Aurora Nine", at: [6500, -200, 4200], tint: [0.55, 0.75, 1.5], color: 0x9fc4ff, size: 14,
+    planets: [["dusty", 2, 60], ["gas", 6, 140, ["#3d7fa8", "#5aa5c8", "#7fc8d8", "#9fdbe6"]]],
+    note: "A BLUE GIANT: so hot and bright that it will burn out in just a few million years. That's too fast for life to get started." },
+  { name: "Tamsin's Star", at: [-2600, 150, 6800], tint: [1, 0.72, 0.45], color: 0xffb070, size: 6,
+    planets: [["jungle", 2.8, 40], ["gas", 5, 95, ["#b89a62", "#cdb57a", "#e3cf98", "#f1e4bf"]], ["cratered", 0.9, 130]],
+    life: "🌿 This planet is GREEN! Something on its land is soaking up starlight... maybe plants?" },
+  { name: "Frostholm", at: [10500, 300, -7000], tint: [0.85, 0.9, 1.2], color: 0xdde8ff, size: 3,
+    planets: [["gas", 6, 50, ["#3d7fa8", "#5aa5c8", "#7fc8d8", "#9fdbe6"]], ["ice", 1.8, 85]],
+    life: "❄️ A frozen ICE WORLD. Under the ice there could be a hidden ocean, warmed from inside, where life might be hiding." },
+  { name: "Ember", at: [-9500, -300, -9800], tint: [1, 0.4, 0.2], color: 0xff5a30, size: 22,
+    planets: [["burnt", 2.2, 70], ["burnt", 1.5, 110]],
+    note: "A dying RED GIANT. It swelled up and scorched its own planets. Any life here is long gone." }
+];
+const LIFE_KINDS = ["ocean", "eyeball", "jungle", "ice"];
+const systems = SYSTEMS.map(s => {
+  const pos = new THREE.Vector3(...s.at), gp = pos.clone().divideScalar(GSCALE);
+  return { ...s, pos, built: false, worlds: [], seen: false, lifeSeen: false, dot: farDot(gp, s.color), label: farLabel((s.life ? "🌱 " : "⭐ ") + s.name, gp, 0.03) };
+});
+
+// Planets in other systems are lit by THEIR star, not yours
+function starLitMat(map, sun, seeThrough = false) {
+  return new THREE.ShaderMaterial({
+    uniforms: { map: { value: map }, sun: { value: sun }, useAlpha: { value: seeThrough ? 1 : 0 } },
+    vertexShader: `varying vec2 vUv; varying vec3 vN; varying vec3 vW;
+      void main() {
+        vUv = uv; vN = normalize(mat3(modelMatrix) * normal);
+        vec4 w = modelMatrix * vec4(position, 1.0); vW = w.xyz;
+        gl_Position = projectionMatrix * viewMatrix * w;
+      }`,
+    fragmentShader: `uniform sampler2D map; uniform vec3 sun; uniform float useAlpha; varying vec2 vUv; varying vec3 vN; varying vec3 vW;
+      void main() {
+        vec4 c = texture2D(map, vUv);
+        float light = max(dot(normalize(vN), normalize(sun - vW)), 0.0);
+        gl_FragColor = vec4(c.rgb * (0.06 + 1.1 * light), useAlpha > 0.5 ? c.a : 1.0);
+      }`,
+    transparent: seeThrough, depthWrite: !seeThrough
+  });
+}
+let alienClouds = null;
+function planetTex(kind, colors) {
+  if (kind === "gas") return gasTex(colors, false);
+  if (kind === "cratered" || kind === "dusty") return rockTex(kind);
+  return sphereTexture(512, 256, (x, y, z) => {
+    const n = fbm(x * 3 + 7, y * 3, z * 3), fine = noise3(x * 30, y * 30, z * 30);
+    if (kind === "ocean") return n > 0.68 ? mixRGB([120, 110, 80], [90, 140, 70], fine) : mixRGB([5, 25, 70], [25, 80, 150], smooth(0.3, 0.68, n));
+    if (kind === "jungle") {
+      if (Math.abs(y) > 0.88) return [235, 240, 245];                                          // ice caps
+      return n > 0.5 ? mixRGB([40, 110, 40], [80, 150, 50], fine) : mixRGB([10, 40, 90], [30, 90, 150], n / 0.5);
+    }
+    if (kind === "ice") return Math.abs(fbm(x * 5, y * 5, z * 5, 3) - 0.5) < 0.015 ? [150, 90, 60] : mixRGB([200, 220, 235], [250, 252, 255], n); // ice with long cracks
+    if (kind === "eyeball") {                                                                    // z points at the star
+      const t = z + (n - 0.5) * 0.3;
+      if (t > 0.55) return mixRGB([200, 120, 60], [240, 180, 100], fine);                         // scorched desert
+      if (t > 0.05) return n > 0.5 ? mixRGB([50, 120, 60], [90, 140, 70], fine) : [30, 90, 140];  // the twilight ring: water and green
+      return mixRGB([220, 230, 240], [255, 255, 255], fine);                                      // frozen night side
+    }
+    return Math.abs(fbm(x * 4, y * 4, z * 4, 4) - 0.5) < 0.02 ? [255, 120, 30] : mixRGB([30, 20, 18], [80, 45, 35], n); // burnt, with glowing lava cracks
+  });
+}
+function buildSystem(s) { // built only when you get close, so the game starts fast
+  s.built = true;
+  const g = new THREE.Group();
+  g.position.copy(s.pos);
+  s.star = new THREE.Mesh(new THREE.SphereGeometry(s.size, 48, 48), starMaterial(s.tint));
+  g.add(s.star);
+  const glow = new THREE.Sprite(new THREE.SpriteMaterial({ map: glowTex, color: s.color, blending: THREE.AdditiveBlending, depthWrite: false }));
+  glow.scale.setScalar(s.size * 7);
+  g.add(glow);
+  for (const [kind, r, dist, colors] of s.planets) {
+    const holder = new THREE.Group(), ball = new THREE.Mesh(new THREE.SphereGeometry(r, 48, 48), starLitMat(planetTex(kind, colors), s.pos));
+    holder.add(ball);
+    if (kind === "ocean" || kind === "jungle") {
+      alienClouds = alienClouds || sphereTexture(512, 256, (x, y, z) => [255, 255, 255, smooth(0.5, 0.72, fbm(x * 3 + 9, y * 5, z * 3)) * 220]);
+      holder.add(new THREE.Mesh(new THREE.SphereGeometry(r * 1.02, 48, 48), starLitMat(alienClouds, s.pos, true)));
+      holder.add(atmosphere(r * 1.06, 0x4da6ff, 1.2, s.pos));
+    }
+    g.add(holder);
+    const orbit = new THREE.Mesh(new THREE.RingGeometry(dist - 0.15, dist + 0.15, 128),
+      new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.1, side: THREE.DoubleSide }));
+    orbit.rotation.x = -Math.PI / 2;
+    g.add(orbit);
+    const w = { holder, ball, kind, r, dist, angle: Math.random() * 7 };
+    s.worlds.push(w);
+    if (LIFE_KINDS.includes(kind)) s.lifeWorld = w;
+  }
+  space.add(g);
+}
+
+// ----- Flying around: warp speed, arriving places, the map in the corner -----
+let warpT = 0, spaceSpeed = 0, wasOutside = false, nextNav = 0;
+const tmpV = new THREE.Vector3();
+function flyHome() {
+  camera.position.set(0, 60, 150);
+  const dir = camera.position.clone().negate().normalize();
+  yaw = Math.atan2(-dir.x, -dir.z);
+  pitch = Math.asin(dir.y);
+  say("🏠 You warped back to your home solar system.");
+}
+function updateGalaxy(dt, t) {
+  const cam = camera.position, gp = cam.clone().divideScalar(GSCALE);
+  for (const s of systems) {
+    const d = cam.distanceTo(s.pos);
+    if (!s.built && d < 6000) buildSystem(s);
+    s.dot.visible = d > 2500;
+    s.label.visible = d > 2500 && d < 80000;
+    if (s.built) {
+      s.star.material.uniforms.time.value = t;
+      s.star.rotation.y += dt * 0.05;
+      for (const w of s.worlds) {
+        w.angle += 7 / Math.pow(w.dist, 1.5) * dt; // Kepler's law: farther planets orbit slower
+        w.holder.position.set(Math.cos(w.angle) * w.dist, 0, Math.sin(w.angle) * w.dist);
+        if (w.kind === "eyeball") w.ball.lookAt(s.pos); else w.ball.rotation.y += dt * 0.15; // the eyeball planet always faces its star
+        const off = cam.clone().sub(w.holder.getWorldPosition(tmpV));
+        if (off.length() < w.r + 1) cam.copy(tmpV).add(off.setLength(w.r + 1)); // planets are solid
+      }
+      if (d < s.size + 5) { cam.copy(s.pos).add(cam.clone().sub(s.pos).setLength(s.size + 5)); say("Ouch! Too hot. Back away from the star."); }
+    }
+    if (!s.seen && d < s.size * 20 + 150) { s.seen = true; sfx.chime(); say(`⭐ You reached ${s.name}! ${s.note || "One of its planets might have life. Fly close to find it."}`); }
+    if (s.lifeWorld && !s.lifeSeen && cam.distanceTo(s.lifeWorld.holder.getWorldPosition(tmpV)) < s.lifeWorld.r * 8) {
+      s.lifeSeen = true; sfx.chime(); say(`🌱 ${s.name}: ${s.life}`);
+    }
+  }
+  homeDot.visible = homeLabel.visible = cam.length() > 2500;
+
+  // Leaving your galaxy and visiting other galaxies
+  const outside = gp.distanceTo(GAL_CENTER) > GAL_R * 1.15 || Math.abs(gp.y - GAL_CENTER.y) > 60;
+  ourLabel.visible = outside;
+  if (outside && !wasOutside) say("🌌 You flew OUT of your galaxy! Look back: billions of stars swirling in spiral arms. Other galaxies are out there too. Hold Shift to warp!");
+  if (!outside && wasOutside) say("✨ Welcome back to your galaxy!");
+  wasOutside = outside;
+  const inG = galaxies.find(G => gp.distanceTo(G.group.position) < G.r);
+  if (inG && !inG.visited) { inG.visited = true; sfx.chime(); say(`${inG.name}: you made it all the way to another galaxy! Every dot of light here is a star, and many of them could have planets.`); }
+
+  if (t > nextNav) { // the map in the corner, a few times a second
+    nextNav = t + 0.2;
+    const near = systems.reduce((b, s) => !b || cam.distanceTo(s.pos) < cam.distanceTo(b.pos) ? s : b, null);
+    const place = cam.length() < 600 ? "☀️ Your home solar system"
+      : cam.distanceTo(near.pos) < 1500 ? (near.life ? "🌱 " : "⭐ ") + near.name
+      : inG ? "Inside " + inG.name : outside ? "🌌 Between the galaxies" : "✨ Deep space in your galaxy";
+    navEl.innerHTML = `🚀 Speed ${Math.round(spaceSpeed).toLocaleString()} &middot; 📏 ${Math.round(cam.length()).toLocaleString()} from home<br>📍 ${place}<br><small>Hold Shift to warp faster &middot; H: fly home</small>`;
   }
 }
 
@@ -5264,6 +5509,7 @@ const keys = {};
 addEventListener("keydown", e => {
   keys[e.code] = true;
   if (e.code === "KeyF") flyToPlanet();
+  if (e.code === "KeyH" && !inOcean && !onLand) flyHome();
   if (e.code === "KeyO" && onLand) { onLand = false; enterOcean(); }           // from land, dive into the sea
   if (e.code === "KeyL" && inOcean && era === "after") { inOcean = false; enterLand(); } // from the sea, walk onto land
 });
@@ -5372,7 +5618,11 @@ function animate() {
   camera.rotation.set(pitch + rand(flash * 0.02), yaw + rand(flash * 0.02), 0); // shakes on impacts
   camera.getWorldDirection(forward);
   right.crossVectors(forward, camera.up).normalize();
-  const speed = (keys.ShiftLeft || keys.ShiftRight ? 60 : 15) * (inOcean ? 0.4 : 1) * dt;
+  const inSpace = !inOcean && !onLand, shift = keys.ShiftLeft || keys.ShiftRight;
+  warpT = inSpace && shift ? warpT + dt : 0; // in space, holding Shift keeps speeding up: warp drive!
+  spaceSpeed = inSpace && shift ? Math.min(60 * Math.pow(3, warpT), 400000) : shift ? 60 : 15;
+  const speed = spaceSpeed * (inOcean ? 0.4 : 1) * dt;
+  navEl.style.display = inSpace ? "block" : "none";
   const before = camera.position.clone();
   if (keys.KeyW) camera.position.addScaledVector(forward, speed);
   if (keys.KeyS) camera.position.addScaledVector(forward, -speed);
@@ -5449,7 +5699,16 @@ function animate() {
       // After the meteor shower, flying onto brown land puts you on the land
       if (era === "after" && isLand(camera.position)) enterLand(); else enterOcean();
     }
-    renderer.render(space, camera);
+    updateGalaxy(dt, t);
+    galaxyCam.position.copy(camera.position).divideScalar(GSCALE); // the shrunk galaxy camera follows yours
+    galaxyCam.quaternion.copy(camera.quaternion);
+    if (galaxyCam.aspect !== camera.aspect) { galaxyCam.aspect = camera.aspect; galaxyCam.updateProjectionMatrix(); }
+    renderer.autoClear = false;
+    renderer.clear();
+    renderer.render(galaxyScene, galaxyCam); // faraway stars and galaxies first...
+    renderer.clearDepth();
+    renderer.render(space, camera);          // ...then everything nearby on top
+    renderer.autoClear = true;
   }
 
   requestAnimationFrame(animate);
