@@ -872,27 +872,33 @@ const land = new THREE.Scene();
 // The bending trick: a few lines added to every land material's shader (the program that places
 // each corner of each shape on screen). It wraps the flat world onto a ball centered below you.
 const BEND_R = { value: 0 }; // 0 = flat (space and the ocean); PLANET_BEND while drawing the land
-const BEND_GLSL = `uniform float bendR;
+// Our own copy of where the camera is and how it looks. (Three.js only sends its built-in copies
+// to some kinds of materials, and without them sprites like speech bubbles and name tags vanish.)
+const BEND_CAM = { value: new THREE.Vector3() }, BEND_VIEW = { value: new THREE.Matrix4() };
+function syncBend() { camera.updateMatrixWorld(); BEND_CAM.value.copy(camera.position); BEND_VIEW.value.copy(camera.matrixWorldInverse); }
+const BEND_GLSL = `uniform float bendR; uniform vec3 bendCam; uniform mat4 bendView;
 vec4 bendWorld(vec4 w) {
   if (bendR <= 0.0) return w;
-  vec2 d = w.xz - cameraPosition.xz;
+  vec2 d = w.xz - bendCam.xz;
   float dist = length(d), a = dist / bendR, r = bendR + w.y; // a = angle around the planet, r = distance from its center
   vec2 dir = dist > 0.0001 ? d / dist : vec2(0.0);
-  vec2 xz = cameraPosition.xz + dir * sin(a) * r;
+  vec2 xz = bendCam.xz + dir * sin(a) * r;
   return vec4(xz.x, cos(a) * r - bendR, xz.y, w.w);
 }
 `;
 function bendCompile(sh) {
   sh.uniforms.bendR = BEND_R;
+  sh.uniforms.bendCam = BEND_CAM;
+  sh.uniforms.bendView = BEND_VIEW;
   sh.vertexShader = sh.vertexShader.replace("void main() {", BEND_GLSL + "void main() {")
     .replace("#include <project_vertex>", `vec4 mvPosition = vec4(transformed, 1.0);
       #ifdef USE_INSTANCING
         mvPosition = instanceMatrix * mvPosition;
       #endif
-      mvPosition = viewMatrix * bendWorld(modelMatrix * mvPosition);
+      mvPosition = bendView * bendWorld(modelMatrix * mvPosition);
       gl_Position = projectionMatrix * mvPosition;`)
     .replace("vec4 mvPosition = modelViewMatrix * vec4( 0.0, 0.0, 0.0, 1.0 );", // sprites (glows, labels)
-             "vec4 mvPosition = viewMatrix * bendWorld(modelMatrix * vec4(0.0, 0.0, 0.0, 1.0));");
+             "vec4 mvPosition = bendView * bendWorld(modelMatrix * vec4(0.0, 0.0, 0.0, 1.0));");
 }
 function bendMat(m) {
   if (!m || m.userData.bent || m.userData.noBend || m.isShaderMaterial) return;
@@ -1028,10 +1034,11 @@ function updateSky(dt) {
   land.background.copy(NIGHT_SKY).lerp(SUNSET_SKY, clamp01((height + 0.15) / 0.15)).lerp(DAY_SKY, clamp01(height / 0.25));
   land.background.lerp(DUST_SKY, dust * 0.85); // asteroid dust blocks the sun
   land.background.lerp(ICE_SKY, ice * 0.4);     // pale Ice Age sky
+  land.background.lerp(SMOG_SKY, smog * 0.5);  // grey factory smoke
   sunHeight = height;
   landSun.intensity *= 1 - dust * 0.8;
   skyStar.material.opacity = 1 - dust * 0.9;
-  land.fog.far = 260 - dust * 170;
+  land.fog.far = 260 - dust * 170 - smog * 70;
   land.fog.color.copy(land.background);
   landStars.material.opacity = 1 - clamp01((height + 0.15) / 0.15); // stars fade in when it's dark
 }
@@ -1380,14 +1387,16 @@ function addTree() {
 // An insect: a small body with two see-through flapping wings
 function addInsect() {
   const bug = new THREE.Group();
-  const body = new THREE.Mesh(new THREE.SphereGeometry(0.12, 6, 5), bugMat);
+  const body = new THREE.Mesh(new THREE.SphereGeometry(0.12, 10, 8), bugMat);
   body.scale.z = 2.5;
   bug.add(body);
+  const head = new THREE.Mesh(new THREE.SphereGeometry(0.08, 8, 6), bugMat);
+  head.position.z = 0.34; // the front (insects fly head first)
+  bug.add(head);
   const wings = [];
   for (const s of [-1, 1]) {
-    const wing = new THREE.Mesh(new THREE.PlaneGeometry(0.5, 0.2), wingMat);
-    wing.geometry.translate(s * 0.25, 0, 0); // wings hinge at the body
-    wing.rotation.x = -Math.PI / 2;
+    const wing = new THREE.Mesh(new THREE.PlaneGeometry(0.5, 0.2).translate(s * 0.25, 0, 0).rotateX(-Math.PI / 2), wingMat); // flat, hinged at the body
+    wing.position.y = 0.05;
     bug.add(wing);
     wings.push(wing);
   }
@@ -4466,7 +4475,7 @@ const marbleMat = new THREE.MeshStandardMaterial({ color: 0xf2efe8, roughness: 0
 const COLUMN_GEO = new THREE.CylinderGeometry(0.15, 0.18, 1, 10), BALL_GEO = new THREE.SphereGeometry(0.35, 10, 8);
 const RING_GEO = new THREE.RingGeometry(0.8, 1, 32), STONE_GEO = new THREE.DodecahedronGeometry(1, 0);
 const ships = [], visitors = [], attackTargets = [], ruins = [], musketTargets = [], fxList = [];
-let workshop = null, inventor = null, hero = null, shipDir = V(1, 0, 0), wrecked = 0, nextUpgrade = 0, nextSmoke = 0;
+let workshop = null, dome = null, inventor = null, hero = null, shipDir = V(1, 0, 0), wrecked = 0, nextUpgrade = 0, nextSmoke = 0;
 
 // A tiny animation system: fx(fn) runs fn(dt) every frame until it returns false
 function fx(fn) { fxList.push(fn); }
@@ -4565,6 +4574,7 @@ function buildDome() { // the Great Dome: a round church with a red dome, like t
   addBent(g);
   grow.push(g);
   solidify(g, 10);
+  dome = g;
 }
 function buildWorkshop() { // the inventor's workshop: shelves of jars, barrels and a big mixing bowl
   workshop = addShop("inventor", "inventor's workshop", "🧪 Inventor's Workshop", 5.9);
@@ -5074,6 +5084,342 @@ function updateRenaissance(dt, t) {
   }
 }
 
+// ---------- The Industrial Age: factories, new materials, brick houses, roads and the first cars ----------
+const factoryBrick = new THREE.MeshStandardMaterial({ map: brickTex, color: 0x9a4a3a });   // dark red factory bricks
+const houseBrick = new THREE.MeshStandardMaterial({ map: brickTex, color: 0xc0644a });
+const slateMat = new THREE.MeshStandardMaterial({ color: 0x4a5058, flatShading: true });  // grey slate roofs
+const sootMat = new THREE.MeshStandardMaterial({ color: 0x2a2a2a });
+const asphaltMat = new THREE.MeshStandardMaterial({ color: 0x3a3a3c }), roadPaint = new THREE.MeshBasicMaterial({ color: 0xf2f2e6 });
+const WHEEL_GEO = new THREE.CylinderGeometry(0.45, 0.45, 0.2, 16).rotateZ(Math.PI / 2);
+const SMOG_SKY = new THREE.Color(0x8a8578);
+const factories = [], cars = [], roadQueue = [];
+let smog = 0, nextRoad = 0, roadLoop = null;
+
+// A point inside a factory: x, z are measured from its middle, with +z toward its big front door
+function fSpot(f, x, z) {
+  const p = V(x, 0, z).applyAxisAngle(UP, f.rotation.y).add(f.position);
+  p.y = standHeight(p.x, p.z);
+  return p;
+}
+function buildFactory(name, product) {
+  const away = [park.c, ...shops.map(s => s.position), ...factories.map(f => f.position)];
+  if (workshop) away.push(workshop.position);
+  if (dome) away.push(dome.position);
+  if (castle) away.push(castle.position);
+  const c = flatSpot(away, 32, 11), base = (c.top ?? c.y) + 0.3, g = new THREE.Group();
+  clearHouses(c, 19);
+  g.position.set(c.x, base, c.z);
+  g.rotation.y = Math.atan2(park.c.x - c.x, park.c.z - c.z); // the big door faces the city
+  slab(g, stoneMat, 20.5, 6, 14.5, 0, -3, 0);                 // a deep stone base, so it never floats
+  hollowWalls(g, factoryBrick, 20, 14, 7, 4, 4.5);             // brick walls with a big door
+  housePart(g, MED_BOX, sootMat, 20.4, 0.3, 14.4, 0, 7.15, 0); // roof
+  for (let i = 0; i < 3; i++) housePart(g, MED_BOX, glassMat, 19, 0.1, 2.6, 0, 8, -4.5 + i * 4.5).rotation.x = 0.5; // sawtooth skylights
+  for (const s of [-1, 1]) for (let i = 0; i < 5; i++) housePart(g, MED_BOX, glassMat, 0.1, 2.2, 1.8, s * 10.02, 4, -5 + i * 2.5); // tall windows
+  const u = { name, product, machines: [], wheels: [], belt: [], stacks: [], pile: [], floor: base, workers: [] };
+  for (const x of [-6.5, 6.5]) {                               // two tall smokestacks
+    const st = new THREE.Mesh(new THREE.CylinderGeometry(0.7, 1, 16, 12), factoryBrick);
+    st.position.set(x, 8, -5.5);
+    g.add(st);
+    housePart(g, MED_BOX, sootMat, 1.6, 0.5, 1.6, x, 16.2, -5.5);
+    u.stacks.push(V(x, 16.8, -5.5));
+  }
+  // Inside: three machines with spinning flywheels, a conveyor belt, and a hot furnace
+  for (const x of [-4, 0.5, 5]) {
+    housePart(g, MED_BOX, ironMat, 2.4, 1.8, 1.4, x, 0.9, -2.5);
+    const wheel = new THREE.Mesh(new THREE.TorusGeometry(0.8, 0.12, 6, 16), ironMat);
+    wheel.position.set(x + 1.35, 1.4, -2.5);
+    wheel.rotation.y = Math.PI / 2;
+    g.add(wheel);
+    u.wheels.push(wheel);
+    u.machines.push({ x, z: -2.5 });
+  }
+  housePart(g, MED_BOX, darkWood, 13, 0.8, 1.1, 0.5, 0.4, 1.2);  // conveyor belt
+  for (let i = 0; i < 6; i++) { const b = housePart(g, MED_BOX, woodMat, 0.6, 0.5, 0.6, -6 + i * 2.2, 1.05, 1.2); u.belt.push(b); }
+  housePart(g, MED_BOX, stoneMat, 2, 2.5, 1.5, 8, 1.25, -5.5);   // furnace
+  u.fire = glowSprite(3);
+  u.fire.material.color.setHex(0xff6a1a);
+  u.fire.position.set(8, 1.2, -4.6);
+  g.add(u.fire);
+  // The workers' corner: they eat, sleep and drink here, and never go home
+  for (let k = 0; k < 5; k++) {                                  // bunk beds along the left wall
+    const z = -5 + k * 2.5;
+    for (const [px, pz] of [[-9.5, z - 0.45], [-9.5, z + 0.45], [-7.7, z - 0.45], [-7.7, z + 0.45]]) housePart(g, MED_BOX, darkWood, 0.1, 2.3, 0.1, px, 1.15, pz);
+    for (const y of [0.5, 1.8]) {
+      housePart(g, MED_BOX, darkWood, 2, 0.12, 1, -8.6, y, z);
+      housePart(g, MED_BOX, sootMat, 1.8, 0.1, 0.8, -8.6, y + 0.1, z);  // thin, dirty mattresses
+    }
+  }
+  housePart(g, MED_BOX, woodMat, 1.2, 0.1, 4, 8.3, 0.9, 3);       // a long table
+  housePart(g, MED_BOX, woodMat, 0.15, 0.85, 3.5, 8.3, 0.45, 3);
+  housePart(g, MED_BOX, darkWood, 0.4, 0.45, 4, 7.2, 0.23, 3);    // bench
+  for (let i = 0; i < 4; i++) oval(g, clayMat, 8.1, 1.0, 1.5 + i, 0.18, 0.06, 0.18); // soup bowls
+  const barrel = new THREE.Mesh(new THREE.CylinderGeometry(0.5, 0.5, 1.1, 10), darkWood);
+  barrel.position.set(8.8, 0.55, -1.5);
+  g.add(barrel);
+  oval(g, waterMat, 8.8, 1.1, -1.5, 0.45, 0.02, 0.45);
+  const label = makeLabel(name);
+  label.scale.set(9, 1.7, 1);
+  label.position.y = 19;
+  g.add(label);
+  g.userData = u;
+  addBent(g);
+  solidify(g, 12);
+  platforms.push({ c: g.position, hw: 10, hd: 7, rot: g.rotation.y, y: base }); // people stand on its floor
+  factories.push(g);
+  return g;
+}
+function startIndustry() {
+  age.industry = true;
+  buildFactory("🏭 Steel Works", "steel");
+  buildFactory("🏭 Brick & Glass Works", "bricks");
+  sfx.whistle();
+}
+
+// ----- Factory work: children and poor adults, forced to live at the machines -----
+const KID_LINES = ["I'm so tired...", "I miss my family.", "When can we go home?", "My hands hurt.", "I want to play outside.", "Is it still night?"];
+const WORKER_LINES = ["Twelve hours today. Again.", "The noise never stops.", "I can't even see the sky in here.", "My back aches.", "Some day this has to change."];
+const BOSS_LINES = ["Faster! Faster!", "No breaks!", "Back to work!", "More steel, more money!", "Nobody leaves until the order is done!"];
+ROLES.factory = h => {
+  const u = h.userData, f = u.factory, F = f.userData, line = Math.random() < 0.25 ? pick(u.kid ? KID_LINES : WORKER_LINES) : null;
+  u.fixY = null;
+  u.fhunger = (u.fhunger || Math.random()) + 0.25;
+  u.fthirst = (u.fthirst || Math.random()) + 0.35;
+  if (sunHeight < -0.1) {                     // night: sleep in the bunk beds, right next to the machines
+    const k = Math.floor(u.slot / 2) % 5, top = u.slot % 2, bed = fSpot(f, -8.6, -5 + k * 2.5 + (top ? 0.1 : -0.1));
+    return doAct(h, "sleep", 8, { to: bed, climb: F.floor + (top ? 1.95 : 0.65), patience: 30, bubble: Math.random() < 0.3 ? pick(["Zzz...", "I wish I was home..."]) : null });
+  }
+  if (u.fthirst > 1) { u.fthirst = 0; return doAct(h, "eat", 3, { to: fSpot(f, 7.8, -1.5 + rand(0.4)), face: fSpot(f, 8.8, -1.5), bubble: "💧" }); }
+  if (u.fhunger > 1.4) { u.fhunger = 0; return doAct(h, "eat", 5, { to: fSpot(f, 7.2, 1.5 + Math.random() * 3), face: fSpot(f, 8.3, 3), bubble: pick(["🍞", "Watery soup again...", "So hungry..."]) }); }
+  const m = F.machines[u.slot % 3];
+  doAct(h, pick(["hammer", "knead", "mine", "inspect"]), 6 + Math.random() * 4, { to: fSpot(f, m.x + (u.slot % 2 ? 0.7 : -0.7), m.z + 1.3), face: fSpot(f, m.x, m.z), bubble: line });
+};
+ROLES.foreman = h => {
+  const f = h.userData.factory, m = pick(f.userData.machines);
+  doAct(h, pick(["command", "command", "inspect", "look"]), 4, { to: fSpot(f, m.x + rand(1.5), m.z + 2.5 + Math.random()), face: fSpot(f, m.x, m.z), bubble: Math.random() < 0.5 ? pick(BOSS_LINES) : null });
+};
+function startFactoryWork() {
+  age.factoryWork = true;
+  let slot = 0;
+  for (const f of factories) {
+    const door = fSpot(f, 0, 9);
+    const kids = humans.filter(h => { const u = h.userData; return !u.role && !u.servant && !u.horse && h.scale.x < u.size * 0.85; }).slice(0, 5);
+    while (kids.length < 5) { addHuman(nearSpot(door, 4), true); kids.push(lastHuman()); } // not enough children? poor families send theirs
+    const adults = freeAdults().slice(0, 5);
+    [...kids, ...adults].forEach((h, i) => {
+      const u = h.userData;
+      if (kids.includes(h)) { u.kid = true; u.size = Math.min(u.size, 0.62); h.scale.setScalar(Math.min(h.scale.x, u.size)); } // they stay children for the whole story
+      Object.assign(u, { role: "factory", act: null, factory: f, slot: i });
+      setLabel(h, "⚙️ " + u.name + (u.kid ? " (child)" : ""));
+      f.userData.workers.push(h);
+    });
+    const boss = freeAdults()[0];
+    if (boss) {
+      Object.assign(boss.userData, { role: "foreman", act: null, factory: f });
+      setLabel(boss, "🎩 " + boss.userData.name + " the Factory Owner");
+      const hat = new THREE.Mesh(new THREE.CylinderGeometry(0.16, 0.17, 0.35, 12), sootMat);
+      hat.position.set(0, 0.32, 0);
+      boss.userData.j.head.add(hat);
+      bendMat(sootMat);
+    }
+    slot++;
+  }
+}
+
+// ----- New materials pile up outside the factories -----
+const MATERIALS = {
+  steel: [{ geo: new THREE.BoxGeometry(3, 0.25, 0.25), mat: ironMat }, { geo: new THREE.CylinderGeometry(0.15, 0.15, 2.5, 8).rotateZ(Math.PI / 2), mat: ironMat }],
+  bricks: [{ geo: new THREE.BoxGeometry(1.2, 0.5, 0.9), mat: houseBrick }, { geo: new THREE.BoxGeometry(1.4, 0.05, 1), mat: glassMat }]
+};
+function newMaterials() {
+  age.materials = true;
+  for (const f of factories) {
+    const F = f.userData;
+    F.nextItem = 0;
+    const sign = makeLabel(F.product === "steel" ? "🔩 Iron & Steel" : "🧱 Bricks & Glass");
+    sign.scale.set(4.5, 0.85, 1);
+    sign.position.copy(fSpot(f, -6, 11)).setY(fSpot(f, -6, 11).y + 4);
+    addBent(sign);
+  }
+}
+function stackItem(f) { // a new item appears on the pile in the factory yard, with a puff of steam
+  const F = f.userData, n = F.pile.length;
+  if (n >= 40) return;
+  const kind = MATERIALS[F.product][n % 2], m = new THREE.Mesh(kind.geo, kind.mat), row = Math.floor(n / 8), col = n % 8;
+  const p = fSpot(f, -8 + (col % 4) * 1.6, 11 + Math.floor(col / 4) * 1.6);
+  m.position.set(p.x, p.y + 0.3 + row * 0.55, p.z);
+  m.rotation.y = f.rotation.y;
+  m.scale.setScalar(0.01);
+  addBent(m);
+  F.pile.push(m);
+  let a = 0;
+  fx(dt => { a += dt; m.scale.setScalar(Math.min(1, a * 3)); return a < 0.4; });
+  for (let i = 0; i < 4; i++) particle(m.position.clone(), 0xffffff, V(rand(0.3), 1.2, rand(0.3)), 1.2);
+}
+
+// ----- Industrial houses: red brick, slate roofs, and chimneys that never stop smoking -----
+function industrialHouse(g) {
+  const { w, d, hgt } = g.userData.dims;
+  g.userData.industrial = true;
+  for (const o of g.children) if (o.isMesh) {
+    if (o.material === plasterMat || o.material === stuccoMat) o.material = houseBrick;
+    else if (o.material === roofBrown || o.material === terracottaMat) o.material = slateMat;
+    else if (o.material === windowMat) o.material = glassMat;
+  }
+  housePart(g, MED_BOX, houseBrick, 0.6, 2.4, 0.6, -w * 0.25, hgt + 2.2, 0);       // a second chimney
+  for (let i = 0; i < 5; i++) housePart(g, MED_BOX, ironMat, 0.06, 0.8, 0.06, -1 + i * 0.5, 0.4, d / 2 + 1.2); // iron railings by the door
+  housePart(g, MED_BOX, ironMat, 2.1, 0.06, 0.06, 0, 0.8, d / 2 + 1.2);
+  if (Math.random() < 0.25) {                                                        // a gas street lamp
+    housePart(g, MED_BOX, ironMat, 0.12, 3.2, 0.12, w / 2 + 0.8, 1.6, d / 2 + 1.5);
+    const lamp = glowSprite(1.2);
+    lamp.material.color.setHex(0xffd88a);
+    lamp.position.set(w / 2 + 0.8, 3.3, d / 2 + 1.5);
+    g.add(lamp);
+  }
+  g.traverse(c => [].concat(c.material || []).forEach(bendMat));
+  let a = 0;
+  fx(dt => { a += dt; g.scale.y = 1 + Math.sin(a * 14) * 0.12 * Math.max(0, 1 - a); if (a < 1) return true; g.scale.y = 1; return false; });
+}
+function industrialHouses() { age.industrialHomes = true; }
+
+// ----- Roads -----
+function roadNodes(pts, loop) { // how high the road is at each point: above the ground there and halfway to its neighbors
+  return pts.map((p, i) => {
+    const n = pts.length, a = pts[(i - 1 + n) % n], b = pts[(i + 1) % n], hs = [groundHeight(p.x, p.z)];
+    if (loop || i > 0) hs.push(groundHeight((p.x + a.x) / 2, (p.z + a.z) / 2));
+    if (loop || i < n - 1) hs.push(groundHeight((p.x + b.x) / 2, (p.z + b.z) / 2));
+    return V(p.x, Math.max(1.3, ...hs) + 0.15, p.z);
+  });
+}
+function roadSegment(a, b) { // a flat strip of asphalt from a to b, with a dashed white line down the middle
+  const len = Math.hypot(b.x - a.x, b.z - a.z), g = new THREE.Group();
+  g.rotation.order = "YXZ";
+  g.position.set((a.x + b.x) / 2, (a.y + b.y) / 2, (a.z + b.z) / 2);
+  g.rotation.y = Math.atan2(b.x - a.x, b.z - a.z);
+  g.rotation.x = -Math.atan2(b.y - a.y, len);
+  housePart(g, MED_BOX, asphaltMat, 5, 1, len + 0.6, 0, -0.5, 0);
+  for (let k = -len / 2 + 1; k < len / 2 - 0.5; k += 3) housePart(g, MED_BOX, roadPaint, 0.15, 0.02, 1.3, 0, 0.01, k);
+  g.scale.x = 0.01;
+  addBent(g);
+  let t = 0;
+  fx(dt => { t += dt; g.scale.x = Math.min(1, t * 2); return t < 0.5; }); // the road spreads out sideways as it's laid
+  for (let i = 0; i < 4; i++) particle(g.position.clone(), 0x9a8a70, V(rand(1), 0.8, rand(1)), 1.5);
+}
+function buildRoads() {
+  age.roads = true;
+  const c = park.c, R = park.r + 48, ring = [];
+  for (let i = 0; i < 48; i++) {
+    const a = i / 48 * Math.PI * 2;
+    let r = R;
+    while (r > park.r + 14 && groundHeight(c.x + Math.cos(a) * r, c.z + Math.sin(a) * r) < 1.5) r -= 3; // keep it on dry land
+    ring.push(V(c.x + Math.cos(a) * r, 0, c.z + Math.sin(a) * r));
+  }
+  roadLoop = roadNodes(ring, true);
+  roadLoop.forEach((p, i) => roadQueue.push([p, roadLoop[(i + 1) % roadLoop.length]]));
+  for (const f of factories) { // a straight road from the ring to each factory's door
+    const door = fSpot(f, 0, 10), start = roadLoop.reduce((b, p) => flatDist(p, door) < flatDist(b, door) ? p : b), n = Math.max(2, Math.ceil(flatDist(start, door) / 8)), pts = [];
+    for (let k = 0; k <= n; k++) pts.push(start.clone().lerp(door, k / n));
+    const nodes = roadNodes(pts, false);
+    for (let k = 0; k < n; k++) roadQueue.push([nodes[k], nodes[k + 1]]);
+  }
+  let total = 0;
+  roadLoop.lengths = roadLoop.map((p, i) => { const l = flatDist(p, roadLoop[(i + 1) % roadLoop.length]); total += l; return l; });
+  roadLoop.total = total;
+}
+function segDist(p, a, b) { // how far p is from the line between a and b (on the ground)
+  const dx = b.x - a.x, dz = b.z - a.z, k = Math.max(0, Math.min(1, ((p.x - a.x) * dx + (p.z - a.z) * dz) / (dx * dx + dz * dz || 1)));
+  return Math.hypot(p.x - a.x - dx * k, p.z - a.z - dz * k);
+}
+
+// ----- The first cars -----
+function makeCar(color) {
+  const g = new THREE.Group(), paint = new THREE.MeshStandardMaterial({ color, metalness: 0.4, roughness: 0.4 }), u = { wheels: [] };
+  housePart(g, MED_BOX, paint, 1.6, 0.6, 3.2, 0, 0.95, 0);                 // body
+  housePart(g, MED_BOX, paint, 1.3, 0.55, 1.1, 0, 1.5, 1.0);               // the engine box at the front
+  housePart(g, MED_BOX, glassMat, 1.3, 0.6, 0.05, 0, 1.9, 0.45);           // windshield
+  housePart(g, MED_BOX, sootMat, 1.2, 0.35, 0.9, 0, 1.4, -0.5);            // leather seat
+  for (const [x, z] of [[-0.75, 0.4], [0.75, 0.4], [-0.75, -1.4], [0.75, -1.4]]) housePart(g, MED_BOX, sootMat, 0.06, 1.2, 0.06, x, 2.1, z); // roof posts
+  housePart(g, MED_BOX, sootMat, 1.7, 0.08, 2, 0, 2.7, -0.5);              // canopy roof
+  for (const s of [-1, 1]) oval(g, goldMat, s * 0.5, 1.4, 1.6, 0.12, 0.12, 0.08); // brass headlamps
+  for (const [x, z] of [[-0.85, 1.1], [0.85, 1.1], [-0.85, -1.1], [0.85, -1.1]]) {
+    const w = new THREE.Mesh(WHEEL_GEO, sootMat);
+    w.position.set(x, 0.45, z);
+    housePart(w, MED_BOX, ironMat, 0.22, 0.75, 0.08, 0, 0, 0);            // spokes, so you can see the wheels turn
+    housePart(w, MED_BOX, ironMat, 0.22, 0.08, 0.75, 0, 0, 0);
+    g.add(w);
+    u.wheels.push(w);
+  }
+  const driver = new THREE.Group();                                        // a driver in a coat and top hat
+  driver.position.set(-0.3, 1.55, -0.5);
+  housePart(driver, MED_BOX, pick(clothMats), 0.45, 0.6, 0.35, 0, 0.3, 0);
+  oval(driver, skinTones ? pick(skinTones) : clayMat, 0, 0.78, 0, 0.16, 0.18, 0.16);
+  housePart(driver, MED_BOX, sootMat, 0.26, 0.3, 0.26, 0, 1.05, 0);
+  g.add(driver);
+  g.userData = u;
+  return g;
+}
+function startCars() {
+  age.cars = true;
+  [0x1a1a1a, 0x8b1e1e, 0x1e5a2e, 0x1e3a7a, 0xd8cfa8].forEach((col, i) => {
+    const car = makeCar(col);
+    car.userData.s = roadLoop.total * i / 5;
+    car.userData.speed = 7;
+    addBent(car);
+    cars.push(car);
+  });
+}
+function roadPoint(s, side) { // a spot on the ring road, s steps along it, moved to the right-hand side
+  const L = roadLoop.lengths;
+  let i = 0;
+  s = ((s % roadLoop.total) + roadLoop.total) % roadLoop.total;
+  while (s > L[i]) { s -= L[i]; i = (i + 1) % L.length; }
+  const a = roadLoop[i], b = roadLoop[(i + 1) % roadLoop.length], k = s / L[i], dir = V(b.x - a.x, 0, b.z - a.z).normalize();
+  const p = a.clone().lerp(b, k).add(V(-dir.z, 0, dir.x).multiplyScalar(side));
+  return { p, heading: Math.atan2(dir.x, dir.z) };
+}
+
+// ----- Every frame -----
+function updateIndustry(dt, t) {
+  if (age.industry) smog = Math.min(0.6, smog + dt * 0.01);  // the sky slowly turns grey with smoke
+  for (const f of factories) {
+    const F = f.userData;
+    for (const w of F.wheels) w.rotation.x += dt * 4;          // flywheels spin
+    for (const b of F.belt) { b.position.x += dt * 1.2; if (b.position.x > 7) b.position.x = -6; } // boxes ride the conveyor
+    F.fire.scale.setScalar(2.6 + Math.random() * 0.8);
+    if (Math.random() < dt * 8) {                              // thick black smoke from the smokestacks
+      const s = pick(F.stacks);
+      particle(f.localToWorld(s.clone()), 0x2e2e2e, V(rand(0.6), 2.5 + Math.random(), rand(0.6)), 6);
+    }
+    if (age.materials && landTime > F.nextItem) { F.nextItem = landTime + 3; stackItem(f); }
+  }
+  if (age.industrialHomes && Math.random() < dt * 3) {          // brick makeovers, one house at a time
+    const g = cityHomes.find(o => o.userData.dims && !o.userData.industrial && o.scale.x >= 1 && !o.userData.falling);
+    if (g) industrialHouse(g);
+  }
+  if (roadQueue.length && landTime > nextRoad) {                // lay the next stretch of road
+    nextRoad = landTime + 0.25;
+    const [a, b] = roadQueue.shift();
+    for (let i = cityHomes.length - 1; i >= 0; i--) if (segDist(cityHomes[i].position, a, b) < 7) { // houses in the way are knocked down
+      puff(cityHomes[i].position);
+      land.remove(cityHomes[i]);
+      cityHomes.splice(i, 1);
+    }
+    roadSegment(a, b);
+  }
+  for (const car of cars) {                                     // cars putt-putt around the ring road
+    const u = car.userData;
+    u.s += u.speed * dt;
+    const { p, heading } = roadPoint(u.s, 1.3), k = (u.s % roadLoop.total + roadLoop.total) % roadLoop.total;
+    let i = 0, s = k;
+    while (s > roadLoop.lengths[i]) { s -= roadLoop.lengths[i]; i = (i + 1) % roadLoop.lengths.length; }
+    const a = roadLoop[i], b = roadLoop[(i + 1) % roadLoop.length];
+    car.position.set(p.x, a.y + (b.y - a.y) * (s / roadLoop.lengths[i]) + Math.abs(Math.sin(t * 12 + u.s)) * 0.04, p.z); // a bumpy ride
+    car.rotation.y = heading;
+    for (const w of u.wheels) w.rotation.x += u.speed * dt / 0.45;
+    if (Math.random() < dt * 5) particle(car.localToWorld(V(0.4, 0.6, -1.8)), 0x777777, V(rand(0.2), 0.6, rand(0.2)), 1.5); // exhaust puffs
+    if (Math.random() < dt * 0.15 && car.position.distanceTo(camera.position) < 50) sfx.honk();
+  }
+}
+
 STAGES.push(
   [BEASTS_AT, "Mammals of ALL SHAPES AND SIZES are appearing: horses, deer, wolves, bears, rhinos and giants!", () => age.beasts = true],
   [APES_AT, "The first APES have appeared! They're clever, and they walk on their knuckles.", () => age.apes = true],
@@ -5125,7 +5471,13 @@ STAGES.push(
   [() => stageAt + 3, "🎯 One BRAVE citizen grabs a musket, runs to the beach and aims for the flagship's gunpowder room...", braveShot, () => wrecked >= Math.min(6, attackTargets.length) || landTime > stageAt + 90],
   [() => stageAt + 2, "💥 A PERFECT SHOT! The flagship's gunpowder explodes and the ship SINKS beneath the bubbling waves! The other ships flee.", null, () => age.sunk],
   [() => stageAt + 14, "🏅 The whole city cheers! The brave citizen is declared a HERO, and a golden statue is built in their honor. The ruined houses get rebuilt.", declareHero],
-  [() => stageAt + 60, "🌍 From a single star to Renaissance heroes, and now you know you're not alone: a whole world of islands is out there. You made life!"]
+  [() => stageAt + 40, "🏭 The INDUSTRIAL REVOLUTION begins! Steam engines power huge new FACTORIES, with tall smokestacks puffing black smoke into the sky.", startIndustry],
+  [() => stageAt + 25, "👧 The factory owners force CHILDREN and poor adults to work at the machines for long, hard hours. Worst of all, the workers must EAT, SLEEP and DRINK inside the factory. They can never go home.", startFactoryWork],
+  [() => stageAt + 35, "⚙️ The factories make NEW MATERIALS: strong iron and steel, cheap bricks and clear glass, piling up in the factory yards.", newMaterials],
+  [() => stageAt + 30, "🏙️ The INDUSTRIAL AGE! Houses are rebuilt with red bricks, slate roofs, iron railings and gas street lamps. Every chimney puffs smoke.", industrialHouses],
+  [() => stageAt + 40, "🛣️ The first ROADS are built: smooth paved streets with white lines down the middle, looping around the city and out to the factories.", buildRoads],
+  [() => stageAt + 5, "🚗 The first CARS! Noisy little machines putt-putt along the new roads, honking at everyone.", startCars, () => !roadQueue.length],
+  [() => stageAt + 60, "🌍 From a single star to factories and the first cars, and a whole world of islands out there. You made life!"]
 );
 
 const watching = () => age.crowd && !age.freed; // the crowd at the pyramid, from the capstone until the workers are freed
@@ -5185,6 +5537,7 @@ function updateHumanAge(dt, t) {
   updateMetropolis(dt);
   updateTown(dt, t);
   updateRenaissance(dt, t);
+  updateIndustry(dt, t);
   for (const f of fires) {                                  // flickering flames
     f.userData.flame.scale.setScalar(2.2 + Math.sin(t * 13 + f.position.x) * 0.3 + Math.random() * 0.2);
     f.userData.light.intensity = 1.3 + Math.random() * 0.4;
@@ -5472,7 +5825,9 @@ const sfx = {
   bang: () => { noise(0.25, 0.22, 2600); tone(320, 0.1, "square", 0.04, 90); },                          // a musket shot
   splash: () => noise(0.8, 0.14, 1100),
   bubble: () => { const f = 250 + Math.random() * 500; tone(f, 0.09, "sine", 0.05, f * 2.2); },
-  fanfare: () => [392, 523, 659, 784, 659, 784].forEach((f, i) => tone(f, i === 5 ? 1 : 0.22, "sawtooth", 0.05, f, i * 0.2))
+  fanfare: () => [392, 523, 659, 784, 659, 784].forEach((f, i) => tone(f, i === 5 ? 1 : 0.22, "sawtooth", 0.05, f, i * 0.2)),
+  whistle: () => { tone(880, 1.4, "sine", 0.07, 850); tone(1320, 1.4, "sine", 0.04, 1280); noise(1.4, 0.05, 3000); }, // factory steam whistle
+  honk: () => { tone(420, 0.22, "square", 0.04, 400); tone(330, 0.3, "square", 0.04, 320, 0.26); }                 // a-ooga!
 };
 
 // Birds sing in the day, crickets chirp at night
@@ -5675,6 +6030,7 @@ function animate() {
     ocean.fog.color.copy(ocean.background);
     camera.position.y = Math.max(camera.position.y, -28); // don't go through the floor
     if (camera.position.y > 30) backToSpace();
+    syncBend();
     renderer.render(ocean, camera);
   } else if (onLand) {
     // Gravity: you fall to the ground unless you hold E to fly up
@@ -5688,6 +6044,7 @@ function animate() {
     for (const s of solids) if (s.userData.inside) s.userData.inside.visible = flatDist(camera.position, s.position) < 40; // only draw furniture near you
     if (camera.position.y > 80) backToSpace();
     BEND_R.value = PLANET_BEND; // bend the land into a ball, only while drawing the land
+    syncBend();
     renderer.render(land, camera);
     BEND_R.value = 0;
   } else {
@@ -5707,6 +6064,7 @@ function animate() {
     renderer.clear();
     renderer.render(galaxyScene, galaxyCam); // faraway stars and galaxies first...
     renderer.clearDepth();
+    syncBend();
     renderer.render(space, camera);          // ...then everything nearby on top
     renderer.autoClear = true;
   }
